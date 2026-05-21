@@ -1,0 +1,61 @@
+﻿# Python cache / bytecode
+__pycache__/
+*.py[cod]
+*$py.class
+
+# Virtual environments
+.venv/
+venv/
+env/
+
+# Notebook / matplotlib cache
+.ipynb_checkpoints/
+.mplconfig/
+
+# Build / packaging
+build/
+dist/
+*.egg-info/
+
+# Logs and system files
+*.log
+*.out
+.DS_Store
+Thumbs.db
+
+# Local test caches
+.pytest_cache/
+.ruff_cache/
+.mypy_cache/
+
+# Generated research artifacts (can be recreated)
+results/**/*.png
+results/**/*.pdf
+results/**/*.pt
+results/**/*.npy
+results/**/.mplconfig/
+
+# Legacy outputs
+resultat/
+experiments/**/attacks/
+experiments_global4/**/attacks/
+experiments_global4_citeseer2/**/attacks/
+experiments_global4_polblogs3/**/attacks/
+experiments_global4_polblogs3_recalc_20260515/**/attacks/
+experiments_global4_wikivote4/**/attacks/
+1HIkDA_anonymity/**/attacks/
+
+# Data conversions and temporary matrices
+matrices/*.npy
+
+# Optional large graph snapshots
+*.gpickle
+
+# Large local research assets (kept locally, not versioned)
+data/
+kdld/
+secGraph/
+umga/
+1HIkDA_anonymity/
+results/
+matrices/

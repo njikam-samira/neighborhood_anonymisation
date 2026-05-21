@@ -1,0 +1,7 @@
+﻿networkx==3.3
+numpy==1.26.4
+pandas==2.2.3
+matplotlib==3.9.2
+scikit-learn==1.6.1
+torch==2.6.0
+torch-geometric==2.6.1
