@@ -1,4 +1,4 @@
-﻿#!/bin/bash
+#!/bin/bash
 #SBATCH --job-name=cora_graphsage_cls
 #SBATCH --chdir=/scratch/rdongmo/IDP-LS/k-Anonymization
 #SBATCH --output=logs/cora_graphsage_%j.out
