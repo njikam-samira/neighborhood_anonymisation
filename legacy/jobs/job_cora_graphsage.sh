@@ -30,10 +30,15 @@ ARCHIVE_DIR="${RESULT_DIR}/archives"
 LOG_FILE="logs/cora_graphsage_${JOB_ID}_${RUN_TIMESTAMP}.log"
 
 SCRIPT="run_cora_graphsage_classification_k_sweep.py"
+DATA_PAIRS="data/cora.pairs"
+DATA_FALLBACK_CANDIDATES=(
+  "secGraph/data/cora.pairs"
+  "kdld/data/cora.pairs"
+  "umga/data/cora.pairs"
+)
 
 REQUIRED_FILES=(
   "${SCRIPT}"
-  "data/cora.pairs"
 )
 
 echo "========================================================"
@@ -52,6 +57,22 @@ export MKL_NUM_THREADS=${SLURM_CPUS_PER_TASK:-16}
 export OPENBLAS_NUM_THREADS=${SLURM_CPUS_PER_TASK:-16}
 
 mkdir -p logs "${RESULT_DIR}" "${PLOTS_DIR}" "${ARCHIVE_DIR}"
+
+if [ ! -f "${DATA_PAIRS}" ]; then
+    echo "[INFO] ${DATA_PAIRS} absent. Tentative de recuperation depuis le projet..."
+    for candidate in "${DATA_FALLBACK_CANDIDATES[@]}"; do
+        if [ -f "${candidate}" ]; then
+            mkdir -p "$(dirname "${DATA_PAIRS}")"
+            cp "${candidate}" "${DATA_PAIRS}"
+            echo "  OK : copie ${candidate} -> ${DATA_PAIRS}"
+            break
+        fi
+    done
+fi
+
+if [ ! -f "${DATA_PAIRS}" ]; then
+    echo "[WARN] ${DATA_PAIRS} introuvable. Le script Python tentera le fallback Planetoid."
+fi
 
 # Sauvegarde de la configuration du job
 cat > "${RESULT_DIR}/config_${JOB_ID}.txt" <<CONFIG_EOF
@@ -108,6 +129,7 @@ echo "  lr          : 0.01"
 echo "  wd          : 5e-4"
 echo "  epochs      : 200"
 echo "  early stop  : active si supporte"
+echo "  data pairs  : ${DATA_PAIRS} ($( [ -f "${DATA_PAIRS}" ] && echo present || echo missing ))"
 echo "  resultats   : ${RESULT_DIR}"
 echo "  graphiques  : ${PLOTS_DIR}"
 echo "  log         : ${LOG_FILE}"
