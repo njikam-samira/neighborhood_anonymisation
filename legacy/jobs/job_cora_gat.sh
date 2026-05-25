@@ -38,8 +38,8 @@ echo "Demarre  : $(date)"
 echo "Dossier  : ${PROJECT_DIR}"
 echo "========================================================"
 
-module load python/3.11.7
-source /scratch/rdongmo/IDP-LS/idp_env/bin/activate
+
+source ~/venv_metrics/bin/activate
 
 mkdir -p logs "${RESULT_DIR}" "${PLOTS_DIR}"
 
