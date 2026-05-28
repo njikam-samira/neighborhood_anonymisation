@@ -107,8 +107,8 @@ echo "========================================================"
 module load python/3.11.7
 
 ENV_CANDIDATES=(
-  "/scratch/rdongmo/IDP-LS/idp_env/bin/activate"
   "${HOME}/venv_metrics/bin/activate"
+  "/scratch/rdongmo/IDP-LS/idp_env/bin/activate"
 )
 
 VENV_ACTIVATE_PATH=""
