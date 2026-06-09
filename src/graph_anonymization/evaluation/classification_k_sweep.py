@@ -2,6 +2,7 @@
 
 import argparse
 import copy
+import pickle
 import random
 import textwrap
 from pathlib import Path
@@ -70,23 +71,371 @@ def set_global_seed(seed: int) -> None:
         torch.cuda.manual_seed_all(seed)
 
 
+PLANETOID_DATASETS = {"cora", "citeseer", "pubmed"}
+DISPLAY_DATASET_NAMES = {
+    "cora": "Cora",
+    "citeseer": "Citeseer",
+    "pubmed": "Pubmed",
+    "enron": "Enron",
+    "polblogs": "PolBlogs",
+    "wiki-vote": "Wiki-Vote",
+}
+DATASET_FILE_STEMS = {
+    "cora": ["cora", "Cora"],
+    "citeseer": ["citeseer", "Citeseer", "CiteSeer"],
+    "pubmed": ["pubmed", "Pubmed", "PubMed"],
+    "enron": ["Enron", "enron"],
+    "polblogs": ["polblogs", "Polblogs", "PolBlogs"],
+    "wiki-vote": ["Wiki-Vote", "wiki-vote", "Wiki_Vote", "wiki_vote", "WikiVote", "wikivote"],
+}
+NODE_FEATURE_ATTR_CANDIDATES = ("x", "features", "feature", "attrs", "attr", "embedding")
+NODE_LABEL_ATTR_CANDIDATES = ("y", "label", "class", "target", "community", "group")
+GRAPH_FEATURE_KEY_CANDIDATES = ("x", "features", "feature_matrix", "node_features")
+GRAPH_LABEL_KEY_CANDIDATES = ("y", "labels", "node_labels", "class_map")
+MASK_KEY_CANDIDATES = ("train_mask", "val_mask", "test_mask")
+
+
+def canonical_dataset_name(dataset: str) -> str:
+    key = str(dataset).strip().lower().replace("_", "-").replace(" ", "-")
+    aliases = {
+        "wikivote": "wiki-vote",
+        "wiki-vote": "wiki-vote",
+        "wiki-vote.": "wiki-vote",
+        "cite-seer": "citeseer",
+    }
+    return aliases.get(key, key)
+
+
 def normalize_dataset_name(dataset: str) -> str:
     mapping = {
         "cora": "Cora",
         "citeseer": "CiteSeer",
         "pubmed": "PubMed",
     }
-    key = str(dataset).strip().lower()
+    key = canonical_dataset_name(dataset)
     return mapping.get(key, dataset)
 
 
-def model_file_slug(model: str) -> str:
-    mapping = {
-        "node2vec_logreg": "node2vec",
-        "graphsage": "graphsage",
-        "gat": "gat",
+def display_dataset_name(dataset: str) -> str:
+    return DISPLAY_DATASET_NAMES.get(canonical_dataset_name(dataset), str(dataset))
+
+
+def dataset_output_slug(dataset: str) -> str:
+    return canonical_dataset_name(dataset).replace("-", "_")
+
+
+def resolve_dataset_artifact(root_dir: Path, dataset: str, suffix: str) -> Path | None:
+    dataset_key = canonical_dataset_name(dataset)
+    for stem in DATASET_FILE_STEMS.get(dataset_key, [dataset_key]):
+        candidate = root_dir / f"{stem}{suffix}"
+        if candidate.exists():
+            return candidate
+    return None
+
+
+def is_git_lfs_pointer(path: Path) -> bool:
+    try:
+        with path.open("r", encoding="utf-8") as handle:
+            first_line = handle.readline().strip()
+    except UnicodeDecodeError:
+        return False
+    except OSError:
+        return False
+    return first_line == "version https://git-lfs.github.com/spec/v1"
+
+
+def _node_sort_key(node: Any) -> tuple[int, str]:
+    try:
+        return (0, f"{int(node):020d}")
+    except (TypeError, ValueError):
+        return (1, str(node))
+
+
+def _as_numeric_vector(value: Any) -> np.ndarray | None:
+    if value is None:
+        return None
+    if torch.is_tensor(value):
+        array = value.detach().cpu().numpy()
+    else:
+        try:
+            array = np.asarray(value, dtype=np.float32)
+        except Exception:
+            return None
+    if array.ndim == 0:
+        array = array.reshape(1)
+    elif array.ndim > 1:
+        array = array.reshape(-1)
+    if array.size == 0:
+        return None
+    array = np.nan_to_num(array.astype(np.float32, copy=False), nan=0.0, posinf=0.0, neginf=0.0)
+    return array
+
+
+def _coerce_label_values(values: Sequence[Any]) -> np.ndarray:
+    if not values:
+        raise ValueError("Aucun label disponible pour la classification.")
+
+    numeric_labels: List[float] = []
+    numeric_ok = True
+    for value in values:
+        try:
+            numeric_labels.append(float(value))
+        except (TypeError, ValueError):
+            numeric_ok = False
+            break
+
+    if numeric_ok:
+        arr = np.asarray(numeric_labels, dtype=np.float32)
+        if arr.ndim == 1 and np.all(np.isfinite(arr)):
+            unique = sorted({float(v) for v in arr.tolist()})
+            mapping = {label: idx for idx, label in enumerate(unique)}
+            return np.asarray([mapping[float(v)] for v in arr.tolist()], dtype=np.int64)
+
+    normalized = [str(value) for value in values]
+    classes = sorted(set(normalized))
+    mapping = {label: idx for idx, label in enumerate(classes)}
+    return np.asarray([mapping[label] for label in normalized], dtype=np.int64)
+
+
+def _extract_matrix_from_container(
+    container: Dict[str, Any],
+    keys: Sequence[str],
+    ordered_nodes: Sequence[Any],
+    num_nodes: int,
+) -> np.ndarray | None:
+    for key in keys:
+        if key not in container:
+            continue
+        raw = container[key]
+        if isinstance(raw, dict):
+            rows: List[np.ndarray] = []
+            for node in ordered_nodes:
+                vec = _as_numeric_vector(raw.get(node))
+                if vec is None:
+                    rows = []
+                    break
+                rows.append(vec)
+            if rows and len({row.shape[0] for row in rows}) == 1:
+                return np.vstack(rows).astype(np.float32)
+            continue
+
+        if torch.is_tensor(raw):
+            arr = raw.detach().cpu().numpy()
+        else:
+            try:
+                arr = np.asarray(raw)
+            except Exception:
+                continue
+        if arr.ndim == 1 and arr.shape[0] == num_nodes:
+            return arr.astype(np.float32).reshape(num_nodes, 1)
+        if arr.ndim == 2 and arr.shape[0] == num_nodes:
+            return arr.astype(np.float32)
+    return None
+
+
+def _extract_labels_from_container(
+    container: Dict[str, Any],
+    keys: Sequence[str],
+    ordered_nodes: Sequence[Any],
+    num_nodes: int,
+) -> np.ndarray | None:
+    for key in keys:
+        if key not in container:
+            continue
+        raw = container[key]
+        if isinstance(raw, dict):
+            values = [raw.get(node) for node in ordered_nodes]
+            if any(value is None for value in values):
+                continue
+            return _coerce_label_values(values)
+
+        if torch.is_tensor(raw):
+            arr = raw.detach().cpu().numpy()
+        else:
+            arr = np.asarray(raw)
+        if arr.ndim == 2 and arr.shape[0] == num_nodes:
+            return np.asarray(np.argmax(arr, axis=1), dtype=np.int64)
+        if arr.ndim == 1 and arr.shape[0] == num_nodes:
+            return _coerce_label_values(arr.tolist())
+    return None
+
+
+def _extract_mask_from_container(
+    container: Dict[str, Any],
+    key: str,
+    ordered_nodes: Sequence[Any],
+    num_nodes: int,
+) -> torch.Tensor | None:
+    if key not in container:
+        return None
+    raw = container[key]
+    if isinstance(raw, dict):
+        values = [bool(raw.get(node, False)) for node in ordered_nodes]
+        return torch.as_tensor(values, dtype=torch.bool)
+    if torch.is_tensor(raw):
+        arr = raw.detach().cpu().numpy()
+    else:
+        arr = np.asarray(raw)
+    if arr.ndim == 1 and arr.shape[0] == num_nodes:
+        return torch.as_tensor(arr.astype(bool), dtype=torch.bool)
+    return None
+
+
+def _extract_features_from_node_attrs(graph: nx.Graph, num_nodes: int) -> np.ndarray | None:
+    rows: List[np.ndarray] = []
+    for node in range(num_nodes):
+        node_attrs = dict(graph.nodes[node])
+        vector = None
+        for key in NODE_FEATURE_ATTR_CANDIDATES:
+            vector = _as_numeric_vector(node_attrs.get(key))
+            if vector is not None:
+                break
+        if vector is None:
+            return None
+        rows.append(vector)
+    if len({row.shape[0] for row in rows}) != 1:
+        return None
+    return np.vstack(rows).astype(np.float32)
+
+
+def _extract_labels_from_node_attrs(graph: nx.Graph, num_nodes: int) -> np.ndarray | None:
+    values: List[Any] = []
+    for node in range(num_nodes):
+        node_attrs = dict(graph.nodes[node])
+        label = None
+        for key in NODE_LABEL_ATTR_CANDIDATES:
+            if key in node_attrs:
+                label = node_attrs[key]
+                break
+        if label is None:
+            return None
+        values.append(label)
+    return _coerce_label_values(values)
+
+
+def _extract_masks_from_node_attrs(graph: nx.Graph, num_nodes: int) -> Dict[str, torch.Tensor]:
+    masks: Dict[str, torch.Tensor] = {}
+    for key in MASK_KEY_CANDIDATES:
+        values: List[bool] = []
+        present = False
+        for node in range(num_nodes):
+            node_attrs = dict(graph.nodes[node])
+            if key in node_attrs:
+                present = True
+            values.append(bool(node_attrs.get(key, False)))
+        if present:
+            masks[key] = torch.as_tensor(values, dtype=torch.bool)
+    return masks
+
+
+def _build_structural_features(graph: nx.Graph) -> np.ndarray:
+    num_nodes = graph.number_of_nodes()
+    if num_nodes == 0:
+        return np.zeros((0, 5), dtype=np.float32)
+
+    degrees = np.asarray([float(graph.degree[node]) for node in range(num_nodes)], dtype=np.float32)
+    degree_norm = degrees / max(float(np.max(degrees)) if degrees.size else 1.0, 1.0)
+
+    clustering = np.asarray([float(nx.clustering(graph, node)) for node in range(num_nodes)], dtype=np.float32)
+    core_numbers = nx.core_number(graph) if graph.number_of_edges() > 0 else {node: 0 for node in graph.nodes()}
+    core = np.asarray([float(core_numbers.get(node, 0.0)) for node in range(num_nodes)], dtype=np.float32)
+    core_norm = core / max(float(np.max(core)) if core.size else 1.0, 1.0)
+
+    avg_neighbor_degree = nx.average_neighbor_degree(graph) if graph.number_of_edges() > 0 else {}
+    neighbor = np.asarray([float(avg_neighbor_degree.get(node, 0.0)) for node in range(num_nodes)], dtype=np.float32)
+    neighbor_norm = neighbor / max(float(np.max(neighbor)) if neighbor.size else 1.0, 1.0)
+
+    triangles = np.asarray([float(nx.triangles(graph, node)) for node in range(num_nodes)], dtype=np.float32)
+    triangle_norm = triangles / max(float(np.max(triangles)) if triangles.size else 1.0, 1.0)
+
+    return np.column_stack(
+        [
+            degree_norm,
+            clustering,
+            core_norm,
+            neighbor_norm,
+            triangle_norm,
+        ]
+    ).astype(np.float32)
+
+
+def _build_default_split_masks(num_nodes: int, labels: np.ndarray, seed: int = 42) -> Dict[str, torch.Tensor]:
+    train_mask = np.zeros(num_nodes, dtype=bool)
+    val_mask = np.zeros(num_nodes, dtype=bool)
+    test_mask = np.zeros(num_nodes, dtype=bool)
+    rng = np.random.default_rng(int(seed))
+
+    for label in sorted(set(int(value) for value in labels.tolist())):
+        indices = np.where(labels == label)[0]
+        indices = indices.copy()
+        rng.shuffle(indices)
+
+        if indices.size == 1:
+            train_mask[indices[0]] = True
+            continue
+        if indices.size == 2:
+            train_mask[indices[0]] = True
+            test_mask[indices[1]] = True
+            continue
+
+        train_count = max(1, int(round(0.6 * indices.size)))
+        val_count = max(1, int(round(0.2 * indices.size)))
+        if train_count + val_count >= indices.size:
+            overflow = train_count + val_count - (indices.size - 1)
+            if overflow > 0:
+                val_count = max(1, val_count - overflow)
+        if train_count + val_count >= indices.size:
+            train_count = max(1, indices.size - 2)
+            val_count = 1
+        test_count = indices.size - train_count - val_count
+        if test_count <= 0:
+            test_count = 1
+            if val_count > 1:
+                val_count -= 1
+            else:
+                train_count = max(1, train_count - 1)
+
+        train_idx = indices[:train_count]
+        val_idx = indices[train_count:train_count + val_count]
+        test_idx = indices[train_count + val_count:]
+
+        train_mask[train_idx] = True
+        val_mask[val_idx] = True
+        test_mask[test_idx] = True
+
+    if not val_mask.any():
+        first_train = int(np.flatnonzero(train_mask)[0])
+        train_mask[first_train] = False
+        val_mask[first_train] = True
+    if not test_mask.any():
+        fallback_source = val_mask if val_mask.any() else train_mask
+        first_idx = int(np.flatnonzero(fallback_source)[0])
+        fallback_source[first_idx] = False
+        test_mask[first_idx] = True
+    if not train_mask.any():
+        first_idx = int(np.flatnonzero(~train_mask)[0])
+        train_mask[first_idx] = True
+        if val_mask[first_idx]:
+            val_mask[first_idx] = False
+        elif test_mask[first_idx]:
+            test_mask[first_idx] = False
+
+    return {
+        "train_mask": torch.as_tensor(train_mask, dtype=torch.bool),
+        "val_mask": torch.as_tensor(val_mask, dtype=torch.bool),
+        "test_mask": torch.as_tensor(test_mask, dtype=torch.bool),
     }
-    return mapping.get(str(model).lower(), str(model).lower())
+
+
+def _edge_index_from_graph(graph: nx.Graph) -> torch.Tensor:
+    edges = [(int(u), int(v)) for u, v in graph.edges() if int(u) != int(v)]
+    if not edges:
+        return torch.empty((2, 0), dtype=torch.long)
+    arr = np.asarray(edges, dtype=np.int64)
+    rev = arr[:, [1, 0]]
+    all_edges = np.vstack([arr, rev])
+    all_edges = np.unique(all_edges, axis=0)
+    return torch.from_numpy(all_edges.T).long()
 
 
 def load_planetoid_data(dataset: str, root_dir: Path) -> Data:
@@ -98,8 +447,159 @@ def load_planetoid_data(dataset: str, root_dir: Path) -> Data:
     return data
 
 
-def load_base_graph(pair_path: Path, fallback_data: Data) -> nx.Graph:
-    if pair_path.exists():
+def _load_custom_dataset_bundle(dataset: str, data_root: Path) -> tuple[Data, nx.Graph, Dict[Any, int]]:
+    gpickle_path = resolve_dataset_artifact(data_root, dataset, ".gpickle")
+    if gpickle_path is None:
+        raise FileNotFoundError(
+            f"Aucun fichier .gpickle trouve pour le dataset '{dataset}' dans {data_root}."
+        )
+    if is_git_lfs_pointer(gpickle_path):
+        raise RuntimeError(
+            f"Le fichier {gpickle_path} est un pointeur Git LFS non resolu. "
+            "Recuperez le contenu binaire reel avant de lancer la classification."
+        )
+
+    with gpickle_path.open("rb") as handle:
+        loaded = pickle.load(handle)
+
+    if isinstance(loaded, Data):
+        data = copy.deepcopy(loaded)
+        data.x = data.x.float()
+        data.y = data.y.long()
+        graph = nx.Graph()
+        edge_index = data.edge_index.detach().cpu().numpy()
+        for src, dst in edge_index.T:
+            graph.add_edge(int(src), int(dst))
+        graph.add_nodes_from(range(int(data.num_nodes)))
+        identity_mapping = {int(node): int(node) for node in range(int(data.num_nodes))}
+        return data, prepare_simple_graph(graph), identity_mapping
+
+    graph_obj = loaded
+    graph_metadata: Dict[str, Any] = {}
+    if isinstance(loaded, dict):
+        if isinstance(loaded.get("data"), Data):
+            data = copy.deepcopy(loaded["data"])
+            data.x = data.x.float()
+            data.y = data.y.long()
+            graph = nx.Graph()
+            edge_index = data.edge_index.detach().cpu().numpy()
+            for src, dst in edge_index.T:
+                graph.add_edge(int(src), int(dst))
+            graph.add_nodes_from(range(int(data.num_nodes)))
+            identity_mapping = {int(node): int(node) for node in range(int(data.num_nodes))}
+            return data, prepare_simple_graph(graph), identity_mapping
+        for key in ("graph", "G", "nx_graph"):
+            if isinstance(loaded.get(key), nx.Graph):
+                graph_obj = loaded[key]
+                graph_metadata = {meta_key: meta_value for meta_key, meta_value in loaded.items() if meta_key != key}
+                break
+
+    if not isinstance(graph_obj, nx.Graph):
+        raise TypeError(
+            f"Format .gpickle non supporte pour le dataset '{dataset}': {type(graph_obj)!r}"
+        )
+
+    raw_graph = nx.Graph(graph_obj)
+    raw_graph.remove_edges_from(nx.selfloop_edges(raw_graph))
+    ordered_nodes = sorted(raw_graph.nodes(), key=_node_sort_key)
+    node_mapping = {node: idx for idx, node in enumerate(ordered_nodes)}
+    graph = nx.relabel_nodes(raw_graph, node_mapping, copy=True)
+    graph = prepare_simple_graph(graph)
+    num_nodes = graph.number_of_nodes()
+
+    feature_matrix = _extract_matrix_from_container(graph_metadata, GRAPH_FEATURE_KEY_CANDIDATES, ordered_nodes, num_nodes)
+    if feature_matrix is None:
+        feature_matrix = _extract_matrix_from_container(raw_graph.graph, GRAPH_FEATURE_KEY_CANDIDATES, ordered_nodes, num_nodes)
+    if feature_matrix is None:
+        feature_matrix = _extract_features_from_node_attrs(graph, num_nodes)
+    if feature_matrix is None:
+        feature_matrix = _build_structural_features(graph)
+
+    labels = _extract_labels_from_container(graph_metadata, GRAPH_LABEL_KEY_CANDIDATES, ordered_nodes, num_nodes)
+    if labels is None:
+        labels = _extract_labels_from_container(raw_graph.graph, GRAPH_LABEL_KEY_CANDIDATES, ordered_nodes, num_nodes)
+    if labels is None:
+        labels = _extract_labels_from_node_attrs(graph, num_nodes)
+    if labels is None:
+        raise ValueError(
+            f"Aucun label exploitable trouve dans {gpickle_path} pour le dataset '{dataset}'."
+        )
+
+    masks: Dict[str, torch.Tensor] = {}
+    for mask_name in MASK_KEY_CANDIDATES:
+        mask = _extract_mask_from_container(graph_metadata, mask_name, ordered_nodes, num_nodes)
+        if mask is None:
+            mask = _extract_mask_from_container(raw_graph.graph, mask_name, ordered_nodes, num_nodes)
+        if mask is not None:
+            masks[mask_name] = mask
+    node_masks = _extract_masks_from_node_attrs(graph, num_nodes)
+    masks.update({key: value for key, value in node_masks.items() if key not in masks})
+    if not {"train_mask", "val_mask", "test_mask"}.issubset(masks):
+        masks.update(_build_default_split_masks(num_nodes=num_nodes, labels=labels, seed=42))
+
+    data = Data(
+        x=torch.as_tensor(feature_matrix, dtype=torch.float32),
+        y=torch.as_tensor(labels, dtype=torch.long),
+        edge_index=_edge_index_from_graph(graph),
+    )
+    data.train_mask = masks["train_mask"].clone().to(dtype=torch.bool)
+    data.val_mask = masks["val_mask"].clone().to(dtype=torch.bool)
+    data.test_mask = masks["test_mask"].clone().to(dtype=torch.bool)
+    return data, graph, node_mapping
+
+
+def _load_graph_from_pairs_with_mapping(pair_path: Path, node_mapping: Dict[Any, int]) -> nx.Graph:
+    graph = nx.Graph()
+    graph.add_nodes_from(range(len(node_mapping)))
+    with pair_path.open("r", encoding="utf-8") as handle:
+        for line in handle:
+            parts = line.strip().split()
+            if len(parts) < 2:
+                continue
+            try:
+                left: Any = int(parts[0])
+            except ValueError:
+                left = parts[0]
+            try:
+                right: Any = int(parts[1])
+            except ValueError:
+                right = parts[1]
+            if left not in node_mapping or right not in node_mapping:
+                continue
+            graph.add_edge(int(node_mapping[left]), int(node_mapping[right]))
+    return prepare_simple_graph(graph)
+
+
+def load_dataset_bundle(dataset: str, data_root: Path, planetoid_root: Path) -> tuple[Data, nx.Graph, Path | None]:
+    dataset_key = canonical_dataset_name(dataset)
+    pair_path = resolve_dataset_artifact(data_root, dataset_key, ".pairs")
+
+    if dataset_key in PLANETOID_DATASETS:
+        data = load_planetoid_data(dataset=dataset_key, root_dir=planetoid_root)
+        base_graph = load_base_graph(pair_path=pair_path, fallback_data=data)
+        return data, base_graph, pair_path
+
+    data, graph_from_dataset, node_mapping = _load_custom_dataset_bundle(dataset=dataset_key, data_root=data_root)
+    if pair_path is not None and pair_path.exists():
+        pair_graph = _load_graph_from_pairs_with_mapping(pair_path=pair_path, node_mapping=node_mapping)
+        if pair_graph.number_of_edges() > 0 and pair_graph.number_of_nodes() == graph_from_dataset.number_of_nodes():
+            graph_from_dataset = pair_graph
+
+    graph_from_dataset.add_nodes_from(range(int(data.num_nodes)))
+    return data, prepare_simple_graph(graph_from_dataset), pair_path
+
+
+def model_file_slug(model: str) -> str:
+    mapping = {
+        "node2vec_logreg": "node2vec",
+        "graphsage": "graphsage",
+        "gat": "gat",
+    }
+    return mapping.get(str(model).lower(), str(model).lower())
+
+
+def load_base_graph(pair_path: Path | None, fallback_data: Data) -> nx.Graph:
+    if pair_path is not None and pair_path.exists():
         graph = prepare_simple_graph(load_graph_from_pairs(pair_path, node_type=int))
     else:
         graph = nx.Graph()
@@ -573,12 +1073,13 @@ def generate_report(
     k_values: List[int],
 ) -> None:
     report_pdf.parent.mkdir(parents=True, exist_ok=True)
+    dataset_label = display_dataset_name(dataset)
     with PdfPages(report_pdf) as pdf:
         render_text_page(
             pdf,
-            f"{dataset} - {model} classification k-sweep",
+            f"{dataset_label} - {model} classification k-sweep",
             [
-                f"Dataset: {dataset}",
+                f"Dataset: {dataset_label}",
                 f"Modele: {model}",
                 f"k values: {', '.join(str(k) for k in k_values)}",
                 "Seeds: 42, 123, 2024",
@@ -648,19 +1149,19 @@ def run_k_sweep(args: argparse.Namespace, model: str) -> None:
     plots_dir = Path(args.plots_dir) if args.plots_dir else output_dir
     plots_dir.mkdir(parents=True, exist_ok=True)
 
-    dataset = str(args.dataset)
+    dataset = canonical_dataset_name(str(args.dataset))
     data_root = Path(args.data_root)
     planetoid_root = Path(args.planetoid_root)
-    pair_path = data_root / f"{dataset.lower()}.pairs"
-
-    try:
-        data_base = load_planetoid_data(dataset=dataset, root_dir=planetoid_root)
-    except Exception as exc:
-        raise RuntimeError(
-            "Chargement Planetoid impossible. Verifiez l'acces internet du noeud "
-            "ou prechargez le dataset dans --planetoid-root."
-        ) from exc
-    base_graph = load_base_graph(pair_path=pair_path, fallback_data=data_base)
+    data_base, base_graph, pair_path = load_dataset_bundle(
+        dataset=dataset,
+        data_root=data_root,
+        planetoid_root=planetoid_root,
+    )
+    if pair_path is None and dataset in PLANETOID_DATASETS:
+        print(
+            f"[INFO] Aucun fichier .pairs trouve pour {display_dataset_name(dataset)} ; "
+            "fallback Planetoid utilise."
+        )
 
     method_order = parse_methods_list(args.methods)
     available = build_anonymizers_for_k(k=2, hikda_max_nodes=int(args.hikda_max_nodes))
@@ -801,7 +1302,7 @@ def run_k_sweep(args: argparse.Namespace, model: str) -> None:
 
     summary_df = build_summary(detailed_df)
 
-    slug = dataset.lower().replace(" ", "_")
+    slug = dataset_output_slug(dataset)
     model_slug = model_file_slug(model)
     detailed_csv = output_dir / f"results_{slug}_{model_slug}_classification.csv"
     summary_csv = output_dir / f"results_{slug}_{model_slug}_classification_summary.csv"
