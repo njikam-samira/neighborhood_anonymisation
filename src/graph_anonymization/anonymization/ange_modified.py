@@ -20,6 +20,8 @@ class AngeModifieConfig:
     k: int
     alpha: float = 1.0
     beta: float = 0.2
+    gamma: float = 0.2
+    delta: float = 0.1
     passes: int = 2
     removal_penalty: float = 0.5
     preserve_original_edges: bool = True
@@ -70,23 +72,348 @@ def _pair_ncc_distance(code_a: NCCCode, code_b: NCCCode) -> float:
     return float(ncc_distance(code_a, code_b, max_value=max_ncc(code_a, code_b)))
 
 
+def _ncc_code_weight(code: NCCCode) -> float:
+    total = 0.0
+    for size, edges, deg_seq in code:
+        total += float(abs(size) + abs(edges) + sum(abs(int(x)) for x in deg_seq))
+    return max(1.0, total)
+
+
+def _pair_ncc_distance_with_weights(
+    node_a: int,
+    node_b: int,
+    signatures: Dict[int, NCCCode],
+    signature_weights: Dict[int, float],
+) -> float:
+    return float(
+        ncc_distance(
+            signatures[node_a],
+            signatures[node_b],
+            max_value=max(
+                1.0,
+                float(signature_weights.get(node_a, 1.0)),
+                float(signature_weights.get(node_b, 1.0)),
+            ),
+        )
+    )
+
+
+def _ncc_vector_params(signatures: Dict[int, NCCCode]) -> Tuple[int, int]:
+    max_width = max(
+        [len(component[2]) for code in signatures.values() for component in code] + [0]
+    )
+    max_components = max([len(code) for code in signatures.values()] + [0])
+    return int(max_width), int(max_components)
+
+
+def _ncc_code_vector(code: NCCCode, degree_width: int, max_components_count: int) -> np.ndarray:
+    values: List[float] = []
+    component_width = 2 + int(degree_width)
+    for idx in range(int(max_components_count)):
+        if idx >= len(code):
+            values.extend([0.0] * component_width)
+            continue
+        size, edges, deg_seq = code[idx]
+        degree_values = list(deg_seq[:degree_width])
+        if len(degree_values) < degree_width:
+            degree_values.extend([0] * (degree_width - len(degree_values)))
+        values.extend([float(size), float(edges)] + [float(value) for value in degree_values])
+    return np.array(values, dtype=np.float64)
+
+
+def _pair_ncc_distance_from_vectors(
+    node_a: int,
+    node_b: int,
+    ncc_vectors: Dict[int, np.ndarray],
+    signature_weights: Dict[int, float],
+) -> float:
+    return float(
+        np.abs(ncc_vectors[node_a] - ncc_vectors[node_b]).sum()
+        / max(
+            1.0,
+            float(signature_weights.get(node_a, 1.0)),
+            float(signature_weights.get(node_b, 1.0)),
+        )
+    )
+
+
+def _common_neighbors_count(graph: nx.Graph, node_a: int, node_b: int) -> int:
+    if graph.number_of_nodes() == 0 or node_a not in graph or node_b not in graph:
+        return 0
+    try:
+        neighbors_a = set(graph.neighbors(node_a))
+        neighbors_b = set(graph.neighbors(node_b))
+    except nx.NetworkXError:
+        return 0
+    return int(len(neighbors_a.intersection(neighbors_b)))
+
+
+def _common_neighbors_count_from_sets(
+    neighbor_sets: Dict[int, Set[int]],
+    node_a: int,
+    node_b: int,
+) -> int:
+    neighbors_a = neighbor_sets.get(int(node_a))
+    neighbors_b = neighbor_sets.get(int(node_b))
+    if neighbors_a is None or neighbors_b is None:
+        return 0
+    if len(neighbors_a) > len(neighbors_b):
+        neighbors_a, neighbors_b = neighbors_b, neighbors_a
+    return int(sum(1 for neighbor in neighbors_a if neighbor in neighbors_b))
+
+
+def _cluster_common_neighbors_distance(
+    graph: nx.Graph,
+    candidate: int,
+    cluster_nodes: Sequence[int],
+    max_common_neighbors: float,
+    neighbor_sets: Dict[int, Set[int]] | None = None,
+) -> float:
+    cn_values = []
+    for ref in cluster_nodes:
+        if candidate == ref:
+            continue
+        if neighbor_sets is None:
+            cn_values.append(_common_neighbors_count(graph, candidate, ref))
+        else:
+            cn_values.append(_common_neighbors_count_from_sets(neighbor_sets, candidate, ref))
+    if not cn_values:
+        return 0.0
+    avg_cn = _safe_mean([float(value) for value in cn_values])
+    return float(1.0 - min(avg_cn / max(float(max_common_neighbors), 1.0), 1.0))
+
+
+def _compute_community_map(graph: nx.Graph, fast_mode: bool = False) -> Dict[int, int]:
+    nodes = sorted(int(node) for node in graph.nodes())
+    if not nodes:
+        return {}
+    if fast_mode:
+        return {node: 0 for node in nodes}
+
+    try:
+        communities = nx.algorithms.community.greedy_modularity_communities(graph)
+    except Exception:
+        return {node: 0 for node in nodes}
+
+    ordered_communities = sorted(
+        [sorted(int(node) for node in community) for community in communities],
+        key=lambda community: (community[0] if community else -1, len(community)),
+    )
+    community_map: Dict[int, int] = {}
+    for community_id, community in enumerate(ordered_communities):
+        for node in community:
+            community_map[int(node)] = int(community_id)
+    return {node: community_map.get(node, 0) for node in nodes}
+
+
+def _cluster_community_distance(
+    candidate: int,
+    cluster_nodes: Sequence[int],
+    community_map: Dict[int, int],
+) -> float:
+    if not cluster_nodes:
+        return 0.0
+    candidate_community = community_map.get(candidate, -1)
+    community_counts: Dict[int, int] = {}
+    for ref in cluster_nodes:
+        ref_community = community_map.get(ref, -1)
+        community_counts[ref_community] = community_counts.get(ref_community, 0) + 1
+    majority_community = min(
+        community_counts,
+        key=lambda community: (-community_counts[community], community),
+    )
+    if candidate_community == majority_community:
+        return 0.0
+
+    mismatches = [
+        1.0 if community_map.get(ref, -1) != candidate_community else 0.0
+        for ref in cluster_nodes
+    ]
+    return float(min(max(_safe_mean(mismatches), 0.0), 1.0))
+
+
 def _cluster_cost(
     candidate: int,
     cluster_nodes: Sequence[int],
+    graph: nx.Graph,
     degrees: Dict[int, int],
     signatures: Dict[int, NCCCode],
+    community_map: Dict[int, int],
     alpha: float,
     beta: float,
+    gamma: float,
+    delta: float,
     max_degree: float,
+    max_common_neighbors: float,
+    neighbor_sets: Dict[int, Set[int]] | None = None,
+    signature_weights: Dict[int, float] | None = None,
+    ncc_vectors: Dict[int, np.ndarray] | None = None,
 ) -> float:
-    # cost(u, C) = alpha * avg degree distance + beta * avg NCC distance
+    # cost(u, C) combines degree similarity, NCC similarity,
+    # common-neighbor preservation, and community consistency.
     deg_dist = _safe_mean(
         [_pair_degree_distance(candidate, ref, degrees, max_degree) for ref in cluster_nodes]
     )
-    ncc_dist = _safe_mean(
-        [_pair_ncc_distance(signatures[candidate], signatures[ref]) for ref in cluster_nodes]
+    if signature_weights is not None and ncc_vectors is not None:
+        ncc_dist = _safe_mean(
+            [
+                _pair_ncc_distance_from_vectors(candidate, ref, ncc_vectors, signature_weights)
+                for ref in cluster_nodes
+            ]
+        )
+    elif signature_weights is None:
+        ncc_dist = _safe_mean(
+            [_pair_ncc_distance(signatures[candidate], signatures[ref]) for ref in cluster_nodes]
+        )
+    else:
+        ncc_dist = _safe_mean(
+            [
+                _pair_ncc_distance_with_weights(candidate, ref, signatures, signature_weights)
+                for ref in cluster_nodes
+            ]
+        )
+    common_neighbors_dist = _cluster_common_neighbors_distance(
+        graph,
+        candidate,
+        cluster_nodes,
+        max_common_neighbors,
+        neighbor_sets,
     )
-    return float((alpha * deg_dist) + (beta * ncc_dist))
+    community_dist = _cluster_community_distance(candidate, cluster_nodes, community_map)
+    return float(
+        (alpha * deg_dist)
+        + (beta * ncc_dist)
+        + (gamma * common_neighbors_dist)
+        + (delta * community_dist)
+    )
+
+
+def _select_best_cluster_candidate(
+    candidates: Set[int],
+    cluster_nodes: Sequence[int],
+    graph: nx.Graph,
+    degrees: Dict[int, int],
+    signatures: Dict[int, NCCCode],
+    community_map: Dict[int, int],
+    alpha: float,
+    beta: float,
+    gamma: float,
+    delta: float,
+    max_degree: float,
+    max_common_neighbors: float,
+    neighbor_sets: Dict[int, Set[int]] | None = None,
+    signature_weights: Dict[int, float] | None = None,
+    ncc_vectors: Dict[int, np.ndarray] | None = None,
+    chunk_size: int = 128,
+) -> int:
+    ordered_candidates = sorted(int(node) for node in candidates)
+    if not ordered_candidates:
+        raise ValueError("No candidates available for cluster selection.")
+
+    refs = [int(node) for node in cluster_nodes]
+    if not refs:
+        return min(ordered_candidates, key=lambda node: (-degrees[node], node))
+
+    ref_count = float(len(refs))
+    ref_degrees = np.array([float(degrees[ref]) for ref in refs], dtype=np.float64)
+    ref_communities = np.array([int(community_map.get(ref, -1)) for ref in refs], dtype=np.int64)
+
+    community_counts: Dict[int, int] = {}
+    for community in ref_communities.tolist():
+        community_counts[int(community)] = community_counts.get(int(community), 0) + 1
+    majority_community = min(
+        community_counts,
+        key=lambda community: (-community_counts[community], community),
+    )
+
+    ref_vectors: np.ndarray | None = None
+    ref_weights: np.ndarray | None = None
+    if signature_weights is not None and ncc_vectors is not None:
+        ref_vectors = np.vstack([ncc_vectors[ref] for ref in refs])
+        ref_weights = np.array(
+            [float(signature_weights.get(ref, 1.0)) for ref in refs],
+            dtype=np.float64,
+        )
+
+    best_node = ordered_candidates[0]
+    best_key = (float("inf"), -degrees[best_node], best_node)
+    chunk = max(1, int(chunk_size))
+
+    for start in range(0, len(ordered_candidates), chunk):
+        candidate_nodes = ordered_candidates[start : start + chunk]
+        candidate_degrees = np.array(
+            [float(degrees[node]) for node in candidate_nodes],
+            dtype=np.float64,
+        )
+        degree_dist = np.abs(candidate_degrees[:, None] - ref_degrees[None, :]).mean(axis=1)
+        degree_dist = degree_dist / max(float(max_degree), 1.0)
+
+        if ref_vectors is not None and ref_weights is not None and signature_weights is not None and ncc_vectors is not None:
+            candidate_vectors = np.vstack([ncc_vectors[node] for node in candidate_nodes])
+            candidate_weights = np.array(
+                [float(signature_weights.get(node, 1.0)) for node in candidate_nodes],
+                dtype=np.float64,
+            )
+            ncc_l1 = np.abs(candidate_vectors[:, None, :] - ref_vectors[None, :, :]).sum(axis=2)
+            denom = np.maximum(
+                np.maximum(candidate_weights[:, None], ref_weights[None, :]),
+                1.0,
+            )
+            ncc_dist = (ncc_l1 / denom).mean(axis=1)
+        else:
+            ncc_dist = np.array(
+                [
+                    _safe_mean(
+                        [
+                            _pair_ncc_distance(signatures[candidate], signatures[ref])
+                            for ref in refs
+                        ]
+                    )
+                    for candidate in candidate_nodes
+                ],
+                dtype=np.float64,
+            )
+
+        common_values: List[float] = []
+        for candidate in candidate_nodes:
+            if neighbor_sets is None:
+                cn_total = sum(_common_neighbors_count(graph, candidate, ref) for ref in refs)
+            else:
+                cn_total = sum(
+                    _common_neighbors_count_from_sets(neighbor_sets, candidate, ref)
+                    for ref in refs
+                )
+            avg_cn = float(cn_total) / ref_count
+            common_values.append(
+                float(1.0 - min(avg_cn / max(float(max_common_neighbors), 1.0), 1.0))
+            )
+        common_neighbors_dist = np.array(common_values, dtype=np.float64)
+
+        community_values: List[float] = []
+        for candidate in candidate_nodes:
+            candidate_community = int(community_map.get(candidate, -1))
+            if candidate_community == majority_community:
+                community_values.append(0.0)
+            else:
+                community_values.append(
+                    float(np.mean(ref_communities != candidate_community))
+                )
+        community_dist = np.array(community_values, dtype=np.float64)
+
+        costs = (
+            (float(alpha) * degree_dist)
+            + (float(beta) * ncc_dist)
+            + (float(gamma) * common_neighbors_dist)
+            + (float(delta) * community_dist)
+        )
+
+        for candidate, cost in zip(candidate_nodes, costs):
+            key = (float(cost), -degrees[candidate], candidate)
+            if key < best_key:
+                best_key = key
+                best_node = int(candidate)
+
+    return best_node
 
 
 def clusterisation_ncc(
@@ -94,6 +421,8 @@ def clusterisation_ncc(
     k: int,
     alpha: float,
     beta: float,
+    gamma: float = 0.2,
+    delta: float = 0.1,
     fast_mode: bool = False,
 ) -> List[List[int]]:
     if fast_mode:
@@ -107,7 +436,16 @@ def clusterisation_ncc(
 
     degrees = {node: int(graph.degree[node]) for node in nodes}
     signatures = calculate_all_ncc(graph, simplified=False)
+    signature_weights = {node: _ncc_code_weight(signatures[node]) for node in nodes}
+    ncc_degree_width, ncc_max_components = _ncc_vector_params(signatures)
+    ncc_vectors = {
+        node: _ncc_code_vector(signatures[node], ncc_degree_width, ncc_max_components)
+        for node in nodes
+    }
+    neighbor_sets = {node: set(int(neighbor) for neighbor in graph.neighbors(node)) for node in nodes}
     max_degree = max(float(max(degrees.values()) if degrees else 1), 1.0)
+    max_common_neighbors = max(float(max(degrees.values()) if degrees else 1), 1.0)
+    community_map = _compute_community_map(graph, fast_mode=fast_mode)
 
     remaining = set(nodes)
     clusters: List[List[int]] = []
@@ -119,13 +457,22 @@ def clusterisation_ncc(
         cluster = [seed]
 
         while len(cluster) < k and remaining:
-            candidate = min(
+            candidate = _select_best_cluster_candidate(
                 remaining,
-                key=lambda node: (
-                    _cluster_cost(node, cluster, degrees, signatures, alpha, beta, max_degree),
-                    -degrees[node],  # tie-break: degree descending
-                    node,  # tie-break: id ascending
-                ),
+                cluster,
+                graph,
+                degrees,
+                signatures,
+                community_map,
+                alpha,
+                beta,
+                gamma,
+                delta,
+                max_degree,
+                max_common_neighbors,
+                neighbor_sets,
+                signature_weights,
+                ncc_vectors,
             )
             cluster.append(candidate)
             remaining.remove(candidate)
@@ -141,7 +488,23 @@ def clusterisation_ncc(
         cluster_index = min(
             range(len(clusters)),
             key=lambda idx: (
-                _cluster_cost(node, clusters[idx], degrees, signatures, alpha, beta, max_degree),
+                _cluster_cost(
+                    node,
+                    clusters[idx],
+                    graph,
+                    degrees,
+                    signatures,
+                    community_map,
+                    alpha,
+                    beta,
+                    gamma,
+                    delta,
+                    max_degree,
+                    max_common_neighbors,
+                    neighbor_sets,
+                    signature_weights,
+                    ncc_vectors,
+                ),
                 -len(clusters[idx]),
                 idx,
             ),
@@ -467,11 +830,31 @@ def diagnose_anonymization(original_graph: nx.Graph, anonymized_graph: nx.Graph)
     else:
         edge_intersection = float(preserved / len(original_edges)) if original_edges else 0.0
 
+    def safe_connected_components_count(graph: nx.Graph) -> float:
+        if graph.number_of_nodes() == 0:
+            return 0.0
+        try:
+            return float(nx.number_connected_components(graph))
+        except Exception:
+            return 0.0
+
+    def safe_average_clustering(graph: nx.Graph) -> float:
+        if graph.number_of_nodes() == 0:
+            return 0.0
+        try:
+            return float(nx.average_clustering(graph))
+        except Exception:
+            return 0.0
+
     return {
         "num_nodes_original": float(original_graph.number_of_nodes()),
         "num_nodes_anonymized": float(anonymized_graph.number_of_nodes()),
         "num_edges_original": float(original_graph.number_of_edges()),
         "num_edges_anonymized": float(anonymized_graph.number_of_edges()),
+        "num_connected_components_original": safe_connected_components_count(original_graph),
+        "num_connected_components_anonymized": safe_connected_components_count(anonymized_graph),
+        "average_clustering_original": safe_average_clustering(original_graph),
+        "average_clustering_anonymized": safe_average_clustering(anonymized_graph),
         "num_original_edges_preserved": float(preserved),
         "edge_intersection": float(edge_intersection),
         "num_edges_added": float(len(anonymized_edges - original_edges)),
@@ -490,11 +873,14 @@ def anonymize_ange_modified_ncc(
     fast_graph_threshold: int = 1000,
     removal_penalty: float = 0.5,
     preserve_original_edges: bool = True,
+    gamma: float = 0.2,
+    delta: float = 0.1,
 ) -> nx.Graph:
     """
     Improved ANGE+NCC anonymization with:
     - full NCC when feasible;
     - cluster-level assignment cost;
+    - common-neighbor and community-aware clustering;
     - add-only harmonization;
     - add-biased local search;
     - optional restoration of original edges.
@@ -506,6 +892,8 @@ def anonymize_ange_modified_ncc(
         k=k,
         alpha=float(alpha),
         beta=float(beta),
+        gamma=float(gamma),
+        delta=float(delta),
         passes=max(1, int(passes)),
         removal_penalty=float(removal_penalty),
         preserve_original_edges=bool(preserve_original_edges),
@@ -529,6 +917,8 @@ def anonymize_ange_modified_ncc(
             cfg.k,
             cfg.alpha,
             cfg.beta,
+            gamma=cfg.gamma,
+            delta=cfg.delta,
             fast_mode=fast_mode,
         )
         max_degree = max(float(max((modified.degree[node] for node in modified.nodes()), default=1)), 1.0)

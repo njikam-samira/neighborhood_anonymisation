@@ -56,6 +56,7 @@ PY_CMD=(
   --k-values "${K_VALUES}"
   --seeds "${SEEDS}"
   --methods "${METHODS}"
+  --hikda-max-nodes 4000
   --output-dir "${RESULT_DIR}"
   --plots-dir "${PLOTS_DIR}"
   --hidden-channels 64
