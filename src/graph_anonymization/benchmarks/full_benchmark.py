@@ -339,6 +339,7 @@ def run_secgraph_ns_attack(
     output_dir: Path,
     run_seed: int,
     theta: float = 0.5,
+    timeout_seconds: int = 75,
 ) -> Dict[str, float | str]:
     output_dir.mkdir(parents=True, exist_ok=True)
     common_nodes = sorted(set(int(n) for n in original_graph.nodes()) & set(int(n) for n in anonymized_graph.nodes()))
@@ -403,7 +404,14 @@ def run_secgraph_ns_attack(
     ]
 
     try:
-        result = subprocess.run(command, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, timeout=75, check=False)
+        result = subprocess.run(
+            command,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+            timeout=int(timeout_seconds),
+            check=False,
+        )
     except subprocess.TimeoutExpired:
         return {
             "deanon_success_pct": float("nan"),
