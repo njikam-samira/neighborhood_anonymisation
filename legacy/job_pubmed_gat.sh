@@ -23,4 +23,4 @@ DATA_GRAPH_ASSET_REQUIRED=0
 DATA_GRAPH_ASSET=""
 DATA_GRAPH_ASSET_FALLBACK_CANDIDATES=()
 
-source "$(dirname "${BASH_SOURCE[0]}")/_classification_job_common.sh"
+source /scratch/rdongmo/IDP-LS/k-Anonymization/legacy/_classification_job_common.sh

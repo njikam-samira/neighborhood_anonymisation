@@ -23,4 +23,4 @@ DATA_GRAPH_ASSET_REQUIRED=1
 DATA_GRAPH_ASSET="data/polblogs.gpickle"
 DATA_GRAPH_ASSET_FALLBACK_CANDIDATES=("kdld/data/polblogs.gpickle")
 
-source "$(dirname "${BASH_SOURCE[0]}")/_classification_job_common.sh"
+source /scratch/rdongmo/IDP-LS/k-Anonymization/legacy/_classification_job_common.sh
