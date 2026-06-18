@@ -945,7 +945,18 @@ def build_anonymizers_for_k(k: int, hikda_max_nodes: int = 3000) -> Dict[str, Ca
         return anonymize_ange_original(graph, k=_k, seed=seed)
 
     def ange_modified_wrapper(graph: nx.Graph, seed: int, _k: int = k) -> nx.Graph:
-        return anonymize_ange_modified_ncc(graph, k=_k, seed=seed)
+        return anonymize_ange_modified_ncc(
+            graph,
+            k=_k,
+            seed=seed,
+            alpha=0.3,
+            beta=0.4,
+            gamma=0.2,
+            delta=0.1,
+            passes=1,
+            max_node_iterations=0,
+            fast_graph_threshold=30000,
+        )
 
     def zhou_pei_wrapper(graph: nx.Graph, seed: int, _k: int = k) -> nx.Graph:
         return anonymize_zhou_pei(graph, k=_k, seed=seed)
