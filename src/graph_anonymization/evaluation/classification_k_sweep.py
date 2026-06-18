@@ -20,6 +20,11 @@ from sklearn.metrics import accuracy_score, f1_score
 from torch import nn
 from torch_geometric.data import Data
 from torch_geometric.datasets import Planetoid
+
+try:
+    from torch_geometric.datasets import PolBlogs
+except Exception:  # pragma: no cover - depends on torch_geometric version
+    PolBlogs = None
 from torch_geometric.nn import GATConv, SAGEConv
 
 try:
@@ -72,6 +77,7 @@ def set_global_seed(seed: int) -> None:
 
 
 PLANETOID_DATASETS = {"cora", "citeseer", "pubmed"}
+PYG_POLBLOGS_DATASETS = {"polblogs"}
 DISPLAY_DATASET_NAMES = {
     "cora": "Cora",
     "citeseer": "Citeseer",
@@ -447,6 +453,43 @@ def load_planetoid_data(dataset: str, root_dir: Path) -> Data:
     return data
 
 
+def load_polblogs_data(root_dir: Path) -> Data:
+    if PolBlogs is None:
+        raise RuntimeError(
+            "torch_geometric.datasets.PolBlogs est indisponible dans cet environnement. "
+            "Mettez a jour torch_geometric ou fournissez data/polblogs.gpickle avec labels."
+        )
+
+    ds = PolBlogs(root=str(root_dir))
+    data = ds[0]
+    data.y = data.y.long()
+
+    graph = nx.Graph()
+    edge_index = data.edge_index.detach().cpu().numpy()
+    for src, dst in edge_index.T:
+        graph.add_edge(int(src), int(dst))
+    graph.add_nodes_from(range(int(data.num_nodes)))
+    graph = prepare_simple_graph(graph)
+
+    if getattr(data, "x", None) is None or int(data.x.numel()) == 0:
+        data.x = torch.as_tensor(_build_structural_features(graph), dtype=torch.float32)
+    else:
+        data.x = data.x.float()
+
+    if not all(hasattr(data, name) for name in MASK_KEY_CANDIDATES):
+        masks = _build_default_split_masks(
+            num_nodes=int(data.num_nodes),
+            labels=data.y.detach().cpu().numpy(),
+            seed=42,
+        )
+        data.train_mask = masks["train_mask"]
+        data.val_mask = masks["val_mask"]
+        data.test_mask = masks["test_mask"]
+
+    data.edge_index = _edge_index_from_graph(graph)
+    return data
+
+
 def _load_custom_dataset_bundle(dataset: str, data_root: Path) -> tuple[Data, nx.Graph, Dict[Any, int]]:
     gpickle_path = resolve_dataset_artifact(data_root, dataset, ".gpickle")
     if gpickle_path is None:
@@ -578,6 +621,22 @@ def load_dataset_bundle(dataset: str, data_root: Path, planetoid_root: Path) -> 
         data = load_planetoid_data(dataset=dataset_key, root_dir=planetoid_root)
         base_graph = load_base_graph(pair_path=pair_path, fallback_data=data)
         return data, base_graph, pair_path
+
+    if dataset_key in PYG_POLBLOGS_DATASETS:
+        try:
+            data = load_polblogs_data(root_dir=planetoid_root)
+            base_graph = load_base_graph(pair_path=None, fallback_data=data)
+            return data, base_graph, pair_path
+        except Exception as exc:
+            if resolve_dataset_artifact(data_root, dataset_key, ".gpickle") is None:
+                raise RuntimeError(
+                    "Impossible de charger PolBlogs via torch_geometric et aucun "
+                    "data/polblogs.gpickle exploitable n'est disponible."
+                ) from exc
+            print(
+                "[WARN] Chargement torch_geometric PolBlogs indisponible ; "
+                "fallback vers data/polblogs.gpickle."
+            )
 
     data, graph_from_dataset, node_mapping = _load_custom_dataset_bundle(dataset=dataset_key, data_root=data_root)
     if pair_path is not None and pair_path.exists():
